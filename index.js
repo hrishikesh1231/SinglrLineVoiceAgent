@@ -1,4 +1,4 @@
-// index.js (Streaming Version - from YouTube tutorial)
+// index.js (Streaming Version - Final Fix)
 
 require('dotenv').config();
 const express = require('express');
@@ -39,45 +39,55 @@ wss.on('connection', (ws) => {
         role: 'system',
         content: 'You are a funny, slightly sarcastic but friendly voice agent. You love telling jokes. Keep your responses concise and conversational.'
     }];
+    
+    let fullAgentResponse = "";
 
     deepgramLive.on('open', () => {
         console.log('Deepgram connection opened.');
 
         deepgramLive.on('transcript', async (data) => {
             const transcript = data.channel.alternatives[0].transcript;
+            
             if (transcript && data.is_final) {
                 console.log(`User said: "${transcript}"`);
                 conversationHistory.push({ role: 'user', content: transcript });
+                fullAgentResponse = "";
 
-                const chatCompletion = await openai.chat.completions.create({
-                    messages: conversationHistory,
-                    model: "gpt-4o-mini",
-                });
-                const agentResponse = chatCompletion.choices[0].message.content;
-                conversationHistory.push({ role: 'assistant', content: agentResponse });
-                console.log(`AI said: "${agentResponse}"`);
-                
-                // Convert AI text to speech and stream back to Twilio
-                const audio = await deepgram.speak.request(
-                    { text: agentResponse },
-                    { model: "aura-asteria-en", encoding: "mulaw", sample_rate: 8000 }
-                );
-                const stream = await audio.getStream();
-                const reader = stream.getReader();
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    // Create the Twilio media message format
-                    const twilioMediaMessage = {
-                        event: 'media',
-                        streamSid: ws.streamSid, // The unique ID of this call's audio stream
-                        media: {
-                            payload: Buffer.from(value).toString('base64'),
-                        },
-                    };
-                    ws.send(JSON.stringify(twilioMediaMessage));
+                try {
+                    const chatCompletion = await openai.chat.completions.create({
+                        messages: conversationHistory,
+                        model: "gpt-4o-mini",
+                        stream: true,
+                    });
+
+                    for await (const chunk of chatCompletion) {
+                        const content = chunk.choices[0]?.delta?.content || "";
+                        if (content) {
+                            deepgramLive.speak(content);
+                            fullAgentResponse += content;
+                        }
+                    }
+
+                    if (fullAgentResponse) {
+                        conversationHistory.push({ role: 'assistant', content: fullAgentResponse });
+                        console.log(`AI said: "${fullAgentResponse}"`);
+                    }
+
+                } catch (error) {
+                    console.error('An error occurred during the AI conversation:', error);
                 }
             }
+        });
+
+        deepgramLive.on('speak', (data) => {
+            const twilioMediaMessage = {
+                event: 'media',
+                streamSid: ws.streamSid,
+                media: {
+                    payload: Buffer.from(data).toString('base64'),
+                },
+            };
+            ws.send(JSON.stringify(twilioMediaMessage));
         });
 
         deepgramLive.on('close', () => console.log('Deepgram connection closed.'));
@@ -93,7 +103,6 @@ wss.on('connection', (ws) => {
         }
 
         if (twilioMessage.event === 'media') {
-            // Forward the raw audio from Twilio to Deepgram
             deepgramLive.send(Buffer.from(twilioMessage.media.payload, 'base64'));
         }
     });
@@ -105,15 +114,20 @@ wss.on('connection', (ws) => {
 });
 
 // --- 4. Express Routes ---
-
 // This is the webhook Twilio will call when someone dials your number
 app.post('/twilio-webhook', (req, res) => {
-    console.log('--- Received a call on Twilio number. Connecting to WebSocket... ---');
+    console.log('--- Received a call on Twilio number. ---');
     const response = new VoiceResponse();
-    // Instruct Twilio to start a bi-directional audio stream to our WebSocket server
+    
+    // THE CRITICAL FIX: Say the greeting first...
+    response.say('Hello! You are connected to the funny AI agent. Please start speaking after this message.');
+    
+    // ...THEN connect to the WebSocket stream.
+    console.log('Connecting to WebSocket...');
     response.connect().stream({
         url: `${SERVER_BASE_URL.replace(/^http/, 'ws')}/`,
     });
+    
     res.type('text/xml');
     res.send(response.toString());
 });
@@ -122,3 +136,4 @@ app.post('/twilio-webhook', (req, res) => {
 server.listen(PORT, () => {
     console.log(`Server and WebSocket are listening on port ${PORT}.`);
 });
+
