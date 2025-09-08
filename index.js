@@ -33,28 +33,41 @@ const conversationHistories = new Map();
 
 // 1. Transcription with Deepgram
 async function transcribeAudio(audioUrl) {
-    console.log("1. Fetching audio from secure Twilio URL...");
+    console.log("Fetching Twilio audio:", audioUrl);
+
     const audioResponse = await fetch(audioUrl, {
-        headers: { 'Authorization': 'Basic ' + Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64') }
+        headers: {
+            'Authorization': 'Basic ' + Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')
+        }
     });
-    if (!audioResponse.ok) throw new Error(`Failed to fetch audio from Twilio. Status: ${audioResponse.status}`);
+
+    if (!audioResponse.ok) {
+        throw new Error(`Failed to fetch audio. Status: ${audioResponse.status}`);
+    }
+
     const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
-    console.log(`   Fetched audio successfully. Now transcribing with Deepgram...`);
+    console.log(`Audio size: ${audioBuffer.length} bytes`);
 
     const response = await deepgram.listen.prerecorded.v("1").transcribeFile(
         audioBuffer,
         { model: "nova-2", smart_format: true }
     );
-    
-    if (response.result && response.result.results && response.result.results.channels[0].alternatives[0]) {
+
+    console.log("Deepgram raw response:", JSON.stringify(response, null, 2));
+
+    if (
+        response.result &&
+        response.result.results &&
+        response.result.results.channels[0].alternatives[0]
+    ) {
         const transcript = response.result.results.channels[0].alternatives[0].transcript;
-        console.log("   Transcription successful:", transcript);
+        console.log("Transcript:", transcript);
         return transcript;
-    } else {
-        console.warn("   Transcription result was empty.");
-        return "";
     }
+
+    return "";
 }
+
 
 // 2. AI Response with OpenAI
 async function getAgentResponse(text, callSid) {
@@ -143,26 +156,36 @@ app.all('/handle-call', (req, res) => {
 // Handle user recording + AI reply
 app.post('/process-recording', async (req, res) => {
     const twiml = new VoiceResponse();
-    const recordingUrl = req.body.RecordingUrl;
     const callSid = req.body.CallSid;
+    const recordingUrl = `${req.body.RecordingUrl}.mp3`; // FIXED ✅
 
     try {
+        console.log(`[${callSid}] - Downloading audio: ${recordingUrl}`);
+
+        // Wait 1 second before fetching Twilio audio (important!)
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
         const userText = await transcribeAudio(recordingUrl);
 
         if (userText && userText.trim().length > 0) {
+            console.log(`[${callSid}] - User said:`, userText);
+
             const agentText = await getAgentResponse(userText, callSid);
 
-            // Use Twilio <Say> for instant response
+            console.log(`[${callSid}] - AI reply:`, agentText);
+
+            // Respond instantly with Twilio TTS
             twiml.say({ voice: 'Polly.Joanna' }, agentText);
         } else {
-            twiml.say("I didn't catch that, could you repeat?");
+            console.warn(`[${callSid}] - Empty transcript! Asking to repeat.`);
+            twiml.say("I didn't catch that, could you say it again?");
         }
     } catch (error) {
-        console.error(`[${callSid}] - Error:`, error);
-        twiml.say("Oops! I had a problem understanding you. Let's try again.");
+        console.error(`[${callSid}] - Error in processing:`, error);
+        twiml.say("Oops, something went wrong. Let's try again.");
     }
 
-    // Wait for next input
+    // Record next user input
     twiml.record({
         action: '/process-recording',
         playBeep: false,
@@ -174,6 +197,7 @@ app.post('/process-recording', async (req, res) => {
     res.type('text/xml');
     res.send(twiml.toString());
 });
+
 
 // Handle call end
 app.post('/call-status', (req, res) => {
