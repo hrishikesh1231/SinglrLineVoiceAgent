@@ -70,16 +70,3 @@ app.get('/start-call', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}.`);
 });
-```
-
-### Summary of the Fix
-
-* **Old Code:** `voice: 'onyx-openai'` (A simple string)
-* **New Code:**
-    ```javascript
-    voice: {
-        provider: 'openai',
-        voiceId: 'onyx'
-    }
-    
-
