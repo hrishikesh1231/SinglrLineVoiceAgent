@@ -1,4 +1,4 @@
-// index.js (Final, Corrected Version)
+// index.js (Reliable OpenAI Version)
 
 require('dotenv').config();
 const express = require('express');
@@ -6,8 +6,7 @@ const twilio = require('twilio');
 const fs = require('fs');
 const path = require('path');
 const OpenAI = require('openai');
-const { createClient } = require('@deepgram/sdk');
-const fetch = require('node-fetch'); // THE CRITICAL FIX IS ADDING THIS LINE
+const fetch = require('node-fetch'); // Required for fetching audio from Twilio
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // --- 1. Credentials and Clients ---
@@ -15,7 +14,6 @@ const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const twilioClient = twilio(twilioAccountSid, twilioAuthToken);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
 // --- 2. App Setup ---
 const app = express();
@@ -27,7 +25,9 @@ const SERVER_BASE_URL = process.env.SERVER_BASE_URL;
 // --- 3. State Management ---
 const conversationHistories = new Map();
 
-// --- 4. Helper Functions ---
+// --- 4. Helper Functions (All using OpenAI) ---
+
+// 1. Speech-to-Text using OpenAI Whisper
 async function transcribeAudio(audioUrl) {
     console.log("1. Fetching audio from secure Twilio URL...");
     const audioResponse = await fetch(audioUrl, {
@@ -35,34 +35,21 @@ async function transcribeAudio(audioUrl) {
             'Authorization': 'Basic ' + Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')
         }
     });
+    if (!audioResponse.ok) throw new Error(`Failed to fetch audio. Status: ${audioResponse.status}`);
+    const audioBlob = await audioResponse.blob();
+    console.log("   Fetched audio successfully. Now transcribing with OpenAI Whisper...");
 
-    if (!audioResponse.ok) {
-        console.error(`Failed to fetch audio from Twilio. Status: ${audioResponse.status}`);
-        throw new Error('Could not retrieve recording from Twilio.');
-    }
-    
-    const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
-    console.log(`   Fetched audio successfully. Size: ${audioBuffer.length} bytes.`);
-
-    console.log("2. Transcribing audio buffer with Deepgram...");
-    
-    const response = await deepgram.listen.prerecorded.v("1").transcribeFile(
-        audioBuffer,
-        { model: "nova-2", smart_format: true }
-    );
-
-    if (response.result && response.result.results && response.result.results.channels[0].alternatives[0]) {
-        const transcript = response.result.results.channels[0].alternatives[0].transcript;
-        console.log("   Transcription successful:", transcript);
-        return transcript;
-    } else {
-        console.warn("   Transcription result was empty. The user was likely silent or ASR failed.");
-        return "";
-    }
+    const transcription = await openai.audio.transcriptions.create({
+        file: await OpenAI.toFile(audioBlob, 'audio.wav'),
+        model: "whisper-1",
+    });
+    console.log("   Transcription successful:", transcription.text);
+    return transcription.text;
 }
 
+// 2. Language Model Response using OpenAI GPT-4o mini
 async function getAgentResponse(text, callSid) {
-    console.log("3. Getting agent response from GPT-4o mini...");
+    console.log("2. Getting agent response from GPT-4o mini...");
     let history = conversationHistories.get(callSid) || [
         { role: 'system', content: 'You are a friendly and helpful voice agent. Keep responses concise.' }
     ];
@@ -74,33 +61,27 @@ async function getAgentResponse(text, callSid) {
     const agentText = chatCompletion.choices[0].message.content;
     history.push({ role: 'assistant', content: agentText });
     conversationHistories.set(callSid, history);
+    console.log("   Agent response:", agentText);
     return agentText;
 }
 
+// 3. Text-to-Speech using OpenAI TTS
 async function generateSpeech(text) {
-    console.log("4. Generating speech with Deepgram Aura...");
+    console.log("3. Generating speech with OpenAI TTS...");
     const audioFileName = `response_${Date.now()}.mp3`;
     const publicDir = path.join(__dirname, 'public');
     if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
     const speechFile = path.join(publicDir, audioFileName);
-    const response = await deepgram.speak.request({ text }, { model: "aura-asteria-en", encoding: "mp3" });
-    const stream = await response.getStream();
-    const buffer = await getAudioBuffer(stream);
+    const mp3 = await openai.audio.speech.create({
+        model: "tts-1",
+        voice: "alloy",
+        input: text,
+    });
+    const buffer = Buffer.from(await mp3.arrayBuffer());
     await fs.promises.writeFile(speechFile, buffer);
     const publicAudioUrl = `${SERVER_BASE_URL}/${audioFileName}`;
     console.log("   Saved speech to:", publicAudioUrl);
     return publicAudioUrl;
-}
-
-async function getAudioBuffer(response) {
-    const reader = response.getReader();
-    const chunks = [];
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-    }
-    return Buffer.concat(chunks);
 }
 
 // --- 5. Express Routes ---
@@ -111,8 +92,6 @@ app.get('/start-call', (req, res) => {
         to: process.env.YOUR_PHONE_NUMBER,
         from: process.env.TWILIO_PHONE_NUMBER,
         statusCallback: `${SERVER_BASE_URL}/call-status`,
-        statusCallbackMethod: 'POST',
-        statusCallbackEvent: ['completed'],
     })
     .then(call => res.send(`Call initiated! SID: ${call.sid}`))
     .catch(error => {
@@ -137,7 +116,7 @@ app.post('/process-recording', async (req, res) => {
     console.log(`[${callSid}] - Received recording. URL: ${recordingUrl}`);
     try {
         const userText = await transcribeAudio(recordingUrl);
-        if (userText && userText.trim().length > 1) {
+        if (userText && userText.trim().length > 0) {
             const agentText = await getAgentResponse(userText, callSid);
             const agentAudioUrl = await generateSpeech(agentText);
             twiml.play(agentAudioUrl);
@@ -164,4 +143,3 @@ app.post('/call-status', (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}.`);
 });
-
