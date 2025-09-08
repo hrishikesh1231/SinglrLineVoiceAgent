@@ -92,6 +92,8 @@ app.get('/start-call', (req, res) => {
         to: process.env.YOUR_PHONE_NUMBER,
         from: process.env.TWILIO_PHONE_NUMBER,
         statusCallback: `${SERVER_BASE_URL}/call-status`,
+        statusCallbackMethod: 'POST',
+        statusCallbackEvent: ['completed', 'failed', 'no-answer']
     })
     .then(call => res.send(`Call initiated! SID: ${call.sid}`))
     .catch(error => {
@@ -134,7 +136,7 @@ app.post('/process-recording', async (req, res) => {
 
 app.post('/call-status', (req, res) => {
     const callSid = req.body.CallSid;
-    console.log(`--- Call ${callSid} has ended. Cleaning up history. ---`);
+    console.log(`--- Call ${callSid} has ended with status: ${req.body.CallStatus}. Cleaning up history. ---`);
     conversationHistories.delete(callSid);
     res.sendStatus(200);
 });
@@ -143,3 +145,4 @@ app.post('/call-status', (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}.`);
 });
+
