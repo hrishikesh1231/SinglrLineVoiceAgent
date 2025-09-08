@@ -1,14 +1,11 @@
-// index.js — Real-time AI Voice Agent (Fixed)
+// index.js — Real-time AI Voice Agent (Fixed + Replies Instantly)
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const WebSocket = require('ws');
 const twilio = require('twilio');
 const OpenAI = require('openai');
 const { createClient } = require('@deepgram/sdk');
-const VoiceResponse = twilio.twiml.VoiceResponse;
 
 const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
@@ -21,9 +18,7 @@ const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static('public'));
 
-// Conversation Memory
 const conversationHistories = new Map();
 
 // === 1. Start Call ===
@@ -46,19 +41,19 @@ app.get('/start-call', async (req, res) => {
 
 // === 2. Handle Incoming Call ===
 app.post('/handle-call', (req, res) => {
-    const twiml = new VoiceResponse();
+    const twiml = new twilio.twiml.VoiceResponse();
 
-    // ✅ Enable live media streaming
+    // Start live media streaming to WebSocket
     twiml.start().stream({
         url: `${SERVER_BASE_URL}/media-stream`,
-        track: "inbound_track"
+        track: 'inbound_track'
     });
 
-    // ✅ Greeting
+    // Greeting message
     twiml.say({ voice: 'Polly.Joanna' }, "Hello Hrishi! I'm your AI assistant. Let's talk live!");
 
-    // ✅ Keep call alive indefinitely
-    twiml.pause({ length: 300 }); // 5 minutes timeout
+    // Keep call alive
+    twiml.pause({ length: 300 });
 
     res.type('text/xml');
     res.send(twiml.toString());
@@ -90,42 +85,37 @@ server.on('upgrade', (req, socket, head) => {
 wss.on('connection', async (ws, req) => {
     console.log("🔗 Twilio connected to media stream");
 
-    // --- Connect to Deepgram Live ---
+    // Connect to Deepgram Live
     const dgLive = deepgram.listen.live({
         model: "nova-2",
         encoding: "mulaw",
         sample_rate: 8000,
-        interim_results: true
+        interim_results: false
     });
 
     dgLive.addListener("open", () => console.log("✅ Connected to Deepgram Live"));
 
-    // === When transcript received ===
     dgLive.addListener("transcriptReceived", async (dgMsg) => {
         const transcript = dgMsg.channel.alternatives[0].transcript;
 
         if (transcript && transcript.trim() !== "") {
             console.log(`👤 User: ${transcript}`);
 
-            // Get AI response from GPT
+            // Get GPT response
             const agentReply = await getAgentResponse(transcript, "call-1");
+            console.log(`🤖 Agent: ${agentReply}`);
 
-            // Generate speech via Deepgram
-            const audioUrl = await generateSpeech(agentReply);
+            // Get PCM audio from Deepgram Aura
+            const pcmBuffer = await getPCMBuffer(agentReply);
 
-            if (audioUrl) {
-                // Send back audio instantly
-                ws.send(JSON.stringify({
-                    event: 'media',
-                    media: { payload: audioUrl }
-                }));
-
-                console.log(`🤖 Agent: ${agentReply}`);
-            }
+            // Send base64 PCM directly to Twilio WebSocket
+            ws.send(JSON.stringify({
+                event: "media",
+                media: { payload: pcmBuffer.toString('base64') }
+            }));
         }
     });
 
-    // === Receive audio chunks from Twilio ===
     ws.on('message', (msg) => {
         const data = JSON.parse(msg);
         if (data.event === "media" && data.media && data.media.payload) {
@@ -142,7 +132,7 @@ wss.on('connection', async (ws, req) => {
 // === 6. GPT Response ===
 async function getAgentResponse(userText, callSid) {
     let history = conversationHistories.get(callSid) || [
-        { role: 'system', content: 'You are a friendly AI voice agent. Keep responses short and natural.' }
+        { role: 'system', content: 'You are a funny and friendly AI voice agent. Keep responses short and natural.' }
     ];
 
     history.push({ role: 'user', content: userText });
@@ -159,40 +149,13 @@ async function getAgentResponse(userText, callSid) {
     return agentText;
 }
 
-// === 7. Deepgram TTS ===
-async function generateSpeech(text) {
-    try {
-        const response = await deepgram.speak.request(
-            { text },
-            { model: "aura-asteria-en", encoding: "mp3" }
-        );
-
-        const stream = await response.getStream();
-        const buffer = await getAudioBuffer(stream);
-
-        const fileName = `response_${Date.now()}.mp3`;
-        const publicDir = path.join(__dirname, 'public');
-        if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
-
-        const speechFile = path.join(publicDir, fileName);
-        await fs.promises.writeFile(speechFile, buffer);
-
-        return `${SERVER_BASE_URL}/${fileName}`;
-    } catch (err) {
-        console.error("❌ TTS Error:", err);
-        return null;
-    }
-}
-
-async function getAudioBuffer(response) {
-    const reader = response.getReader();
-    const chunks = [];
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-    }
-    return Buffer.concat(chunks);
+// === 7. Deepgram Aura → PCM Audio ===
+async function getPCMBuffer(text) {
+    const response = await deepgram.speak.request(
+        { text },
+        { model: "aura-asteria-en", encoding: "linear16", sample_rate: 8000 }
+    );
+    return Buffer.from(await response.getStream().arrayBuffer());
 }
 
 // === 8. Start Server ===
