@@ -37,19 +37,22 @@ app.get('/start-call', async (req, res) => {
                 model: {
                     provider: 'openai',
                     model: 'gpt-4o-mini',
+                    // COST SAVING 1: Add a hard limit on the AI's response length
+                    maxTokens: 50,
                     messages: [
                         {
                             role: 'system',
-                            content: 'You are a funny, slightly sarcastic but friendly voice agent. Keep your responses conversational and not too long.'
+                            // COST SAVING 2: A much stricter prompt to enforce brevity
+                            content: 'You are an extremely efficient and friendly voice agent. Your primary goal is to answer the user\'s question and end the call as quickly as possible to save costs. Keep all responses under 25 words. Do not ask open-ended questions like "Is there anything else I can help with?". If the user signals the end of the conversation (e.g., says "thank you" or "okay bye"), you must respond with only "You\'re welcome. Goodbye!" and nothing else.'
                         }
                     ]
                 },
-                // THE CRITICAL FIX: Use an object for third-party voices
                 voice: {
                     provider: 'openai',
-                    voiceId: 'onyx' // Specify the provider and the voice ID separately
+                    voiceId: 'onyx'
                 },
-                firstMessage: 'Hello! You are connected to the Vapi agent. How can I help you today?'
+                // COST SAVING 3: A shorter, more direct greeting
+                firstMessage: 'Hello, Vapi agent speaking. How can I help?'
             }
         }, {
             headers: {
@@ -70,3 +73,4 @@ app.get('/start-call', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}.`);
 });
+
