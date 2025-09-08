@@ -4,7 +4,8 @@ const express = require('express');
 const twilio = require('twilio');
 const fs = require('fs');
 const path = require('path');
-const OpenAI = require('openai'); // Import the official OpenAI library
+const OpenAI = require('openai');
+const { createClient } = require('@deepgram/sdk'); // Import the new Deepgram library
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // --- 1. Credentials and Clients ---
@@ -12,10 +13,13 @@ const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const twilioClient = twilio(twilioAccountSid, twilioAuthToken);
 
-// Initialize the OpenAI client with your new API key
+// Initialize the OpenAI client (for the "brain")
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
 });
+
+// Initialize the Deepgram client (for the "ears" and "mouth")
+const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
 // --- 2. App Setup ---
 const app = express();
@@ -23,90 +27,83 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public')); 
 const PORT = process.env.PORT || 3000;
 
-// --- 3. State Management ---
-// This part remains the same, to handle conversation history for each call
+// --- 3. State Management (No changes) ---
 const conversationHistories = new Map();
 
-// --- 4. NEW OpenAI-Powered Helper Functions ---
+// --- 4. UPGRADED & NEW Helper Functions ---
 
-// 1. Speech-to-Text using OpenAI Whisper
+// 1. Transcription with Deepgram (Faster)
 async function transcribeAudio(audioUrl) {
-    console.log("1. Transcribing audio with OpenAI Whisper...");
-    // The OpenAI library needs the raw audio file, so we must fetch it from Twilio's URL first.
-    // Twilio protects its recording URLs, so we must authenticate.
-    const audioResponse = await fetch(audioUrl, {
-        headers: {
-            'Authorization': 'Basic ' + Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')
-        }
-    });
-    const audioBlob = await audioResponse.blob();
-
-    // Now, we send the audio file to OpenAI for transcription
-    const transcription = await openai.audio.transcriptions.create({
-        file: await OpenAI.toFile(audioBlob, 'audio.wav'), // Convert the audio blob to a file format OpenAI understands
-        model: "whisper-1",
-    });
-    console.log("   Transcription result:", transcription.text);
-    return transcription.text;
+    console.log("1. Transcribing audio with Deepgram...");
+    const response = await deepgram.listen.prerecorded.v("1").transcribeUrl(
+        { url: audioUrl },
+        // Nova-2 is one of the fastest and most accurate models
+        { model: "nova-2", smart_format: true }
+    );
+    const transcript = response.result.results.channels[0].alternatives[0].transcript;
+    console.log("   Transcription result:", transcript);
+    return transcript;
 }
 
-// 2. Language Model Response using OpenAI GPT-4o mini
-// In your getAgentResponse function
-
+// 2. Thinking with OpenAI (This function remains the same)
 async function getAgentResponse(text, callSid) {
-    console.log("-> Getting agent response from GPT-4o mini...");
+    console.log("2. Getting agent response from GPT-4o mini...");
     let history = conversationHistories.get(callSid) || [
-        { 
-            role: 'system', 
-            // 1. A more forceful prompt for speed and brevity
-            content: 'You are a friendly but extremely brief voice agent. Your goal is speed. Keep all responses under 20 words. Do not use filler phrases.' 
-        }
+        { role: 'system', content: 'You are a funny, slightly sarcastic but friendly voice agent. Keep your responses short and conversational, suitable for a phone call.' }
     ];
     history.push({ role: 'user', content: text });
 
     const chatCompletion = await openai.chat.completions.create({
         messages: history,
         model: "gpt-4o-mini",
-        // 2. Add a hard limit on the response length
-        max_tokens: 40 
     });
 
-    // ... rest of the function is the same
     const agentText = chatCompletion.choices[0].message.content;
     history.push({ role: 'assistant', content: agentText });
     conversationHistories.set(callSid, history);
     console.log("   Agent response:", agentText);
     return agentText;
 }
-// 3. Text-to-Speech using OpenAI TTS
+
+// 3. Text-to-Speech with Deepgram Aura (Faster)
 async function generateSpeech(text, serverUrl) {
-    console.log("3. Generating speech with OpenAI TTS...");
+    console.log("3. Generating speech with Deepgram Aura...");
     const audioFileName = `response_${Date.now()}.mp3`;
     const publicDir = path.join(__dirname, 'public');
-    if (!fs.existsSync(publicDir)) {
-        fs.mkdirSync(publicDir);
-    }
+    if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
     const speechFile = path.join(publicDir, audioFileName);
 
-    // Generate the speech audio and get the result as a buffer
-    const mp3 = await openai.audio.speech.create({
-        model: "tts-1",
-        voice: "alloy", // You can try other voices like 'echo', 'fable', 'onyx', 'nova', 'shimmer'
-        input: text,
-    });
+    // Request the audio from Deepgram's fast Aura model
+    const response = await deepgram.speak.request(
+        { text },
+        { model: "aura-asteria-en", encoding: "mp3" }
+    );
     
-    // Write the audio buffer to a file in our 'public' directory
-    const buffer = Buffer.from(await mp3.arrayBuffer());
+    // Get the audio data as a stream and convert it to a buffer
+    const stream = await response.getStream();
+    const buffer = await getAudioBuffer(stream);
+
+    // Save the audio file
     await fs.promises.writeFile(speechFile, buffer);
-    
-    // Return the public URL to this new audio file
     const publicAudioUrl = `${serverUrl}/${audioFileName}`;
     console.log("   Saved speech to:", publicAudioUrl);
     return publicAudioUrl;
 }
 
-// --- 5. Express Routes (These do not need to change) ---
-// The logic of the routes remains the same; they just call our new OpenAI helper functions.
+// Helper function to handle Deepgram's audio stream
+async function getAudioBuffer(response) {
+    const reader = response.getReader();
+    const chunks = [];
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+    }
+    return Buffer.concat(chunks);
+}
+
+
+// --- 5. Express Routes (No changes needed in their logic) ---
 app.get('/start-call', (req, res) => {
     const serverUrl = req.protocol + '://' + req.get('host');
     console.log(`--- Starting a new call using base URL: ${serverUrl} ---`);
@@ -122,10 +119,10 @@ app.get('/start-call', (req, res) => {
     .catch(error => res.status(500).send(error));
 });
 
-app.all('/handle-call', (req, res) => { // CHANGED THIS LINE from app.post to app.all
-    console.log(`Received a ${req.method} request for /handle-call`); // Added extra logging for debugging
+app.post('/handle-call', (req, res) => {
     const twiml = new VoiceResponse();
-    twiml.say({ voice: 'alice' }, 'Hello! You are connected to the OpenAI agent. What would you like to talk about?');
+    // Updated greeting to reflect the new, faster agent
+    twiml.say({ voice: 'alice' }, 'Hello! You are connected to the upgraded agent. How can I help?');
     twiml.record({ action: '/process-recording', playBeep: false });
     res.type('text/xml');
     res.send(twiml.toString());
