@@ -1,68 +1,155 @@
-// index.js
+// index.js (Optimized Free Version)
 
-// 1. Import all necessary packages
 require('dotenv').config();
 const express = require('express');
 const twilio = require('twilio');
 const fetch = require('node-fetch');
 const VoiceResponse = twilio.twiml.VoiceResponse;
+const fs = require('fs');
+const path = require('path');
 
-// 2. Set up your credentials from the .env file
+// --- Credentials and Clients ---
 const huggingFaceToken = process.env.HUGGING_FACE_TOKEN;
 const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const twilioClient = twilio(twilioAccountSid, twilioAuthToken);
 
+// --- App Setup ---
 const app = express();
 app.use(express.urlencoded({ extended: true }));
-
+app.use(express.static('public')); 
 const PORT = process.env.PORT || 3000;
 
-// 3. Create a simple home route
-app.get('/', (req, res) => {
-    res.send('Voice Agent is running!');
-});
+// --- OPTIMIZED Hugging Face API Endpoints ---
+// These models are smaller and much faster to load on the free tier.
+const STT_API_URL = "https://api-inference.huggingface.co/models/openai/whisper-base"; // Smaller, faster Whisper
+const LLM_API_URL = "https://api-inference.huggingface.co/models/google/gemma-2b-it";   // A fast, high-quality model from Google
+const TTS_API_URL = "https://api-inference.huggingface.co/models/espnet/kan-bayashi_ljspeech_vits";
 
-// 4. Create an endpoint to start the call
+// --- State Management for Conversation History ---
+const conversationHistories = new Map();
+
+// --- API Helper Functions (Adjusted for new models) ---
+
+async function transcribeAudio(audioUrl) {
+    console.log("1. Transcribing audio with whisper-base...");
+    const audioResponse = await fetch(audioUrl);
+    const audioBlob = await audioResponse.blob();
+    const response = await fetch(STT_API_URL, {
+        headers: { Authorization: `Bearer ${huggingFaceToken}` },
+        method: "POST",
+        body: audioBlob,
+    });
+    const result = await response.json();
+    if (result.error) throw new Error(result.error);
+    console.log("   Transcription result:", result.text);
+    return result.text;
+}
+
+async function getAgentResponse(text, callSid) {
+    console.log("2. Getting agent response with gemma-2b-it...");
+    let history = conversationHistories.get(callSid) || [];
+    history.push({ role: 'user', content: text });
+
+    // Gemma model uses a specific prompt format
+    const prompt = `<start_of_turn>user\nYou are a funny, slightly sarcastic but friendly voice agent. Keep your responses short and conversational. The user just said: ${text}<end_of_turn>\n<start_of_turn>model\n`;
+
+    const response = await fetch(LLM_API_URL, {
+        headers: { Authorization: `Bearer ${huggingFaceToken}`, "Content-Type": "application/json" },
+        method: "POST",
+        body: JSON.stringify({
+            inputs: prompt,
+            parameters: { max_new_tokens: 75, return_full_text: false }
+        }),
+    });
+    const result = await response.json();
+    if (result.error) throw new Error(result.error);
+    let agentText = result[0].generated_text.trim() || "I'm not sure what to say.";
+    
+    history.push({ role: 'assistant', content: agentText });
+    conversationHistories.set(callSid, history);
+    console.log("   Agent response:", agentText);
+    return agentText;
+}
+
+async function generateSpeech(text, serverUrl) {
+    console.log("3. Generating speech...");
+    const audioFileName = `response_${Date.now()}.mp3`;
+    const publicDir = path.join(__dirname, 'public');
+    if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
+    const speechFile = path.join(publicDir, audioFileName);
+    
+    const response = await fetch(TTS_API_URL, {
+        headers: { Authorization: `Bearer ${huggingFaceToken}`, "Content-Type": "application/json" },
+        method: "POST",
+        body: JSON.stringify({ inputs: text }),
+    });
+    if (!response.ok) {
+        const errorBody = await response.text();
+        throw new Error(`TTS API failed with status ${response.status}: ${errorBody}`);
+    }
+    const audioBlob = await response.blob();
+    const buffer = Buffer.from(await audioBlob.arrayBuffer());
+    await fs.promises.writeFile(speechFile, buffer);
+    
+    const publicAudioUrl = `${serverUrl}/${audioFileName}`;
+    console.log("   Saved speech to:", publicAudioUrl);
+    return publicAudioUrl;
+}
+
+// --- Express Routes ---
 app.get('/start-call', (req, res) => {
-    console.log("Starting call...");
+    const serverUrl = req.protocol + '://' + req.get('host');
+    console.log(`--- Starting a new call using base URL: ${serverUrl} ---`);
     twilioClient.calls.create({
-        url: 'https://singlelinevoiceagent.onrender.com/handle-call', // We will replace this URL later
+        url: `${serverUrl}/handle-call`,
         to: process.env.YOUR_PHONE_NUMBER,
         from: process.env.TWILIO_PHONE_NUMBER
     })
-    .then(call => {
-        console.log('Call initiated with SID:', call.sid);
-        res.send(`Call initiated to ${process.env.YOUR_PHONE_NUMBER}`);
-    })
-    .catch(error => {
-        console.error(error);
-        res.status(500).send('Failed to start call.');
-    });
+    .then(call => res.send(`Call initiated! SID: ${call.sid}`))
+    .catch(error => res.status(500).send(error));
 });
 
-// 5. Create the main endpoint for Twilio to interact with
 app.post('/handle-call', (req, res) => {
     const twiml = new VoiceResponse();
-
-    // Greet the user and start listening
-    twiml.say({ voice: 'alice' }, 'Hello! The funny agent is here. Tell me something, and I will try to reply.');
-    
-    // Record the user's speech and send it to the /process-recording endpoint
-    twiml.record({
-        action: '/process-recording',
-        maxLength: 15, // Max recording length in seconds
-        finishOnKey: '#', // Stop recording if user presses #
-        playBeep: false
-    });
-
+    twiml.say({ voice: 'alice' }, 'Hello there! Connecting to the agent. Please tell me something after the beep.');
+    twiml.record({ action: '/process-recording', playBeep: true });
     res.type('text/xml');
     res.send(twiml.toString());
 });
 
-// We will add the /process-recording endpoint in a later step
+app.post('/process-recording', async (req, res) => {
+    const twiml = new VoiceResponse();
+    const recordingUrl = req.body.RecordingUrl;
+    const callSid = req.body.CallSid;
+    const serverUrl = req.protocol + '://' + req.get('host');
+    try {
+        console.log(`[${callSid}] - Step 1: Starting transcription...`);
+        const userText = await transcribeAudio(recordingUrl);
+        console.log(`[${callSid}] - Step 1 SUCCESS: Transcription received.`);
 
-// Start the server
-app.listen(PORT, () => {
-    console.log(`Server is listening on port ${PORT}`);
+        if (userText && userText.trim().length > 1) {
+            console.log(`[${callSid}] - Step 2: Getting agent response...`);
+            const agentText = await getAgentResponse(userText, callSid);
+            console.log(`[${callSid}] - Step 2 SUCCESS: Agent response received.`);
+
+            console.log(`[${callSid}] - Step 3: Generating speech...`);
+            const agentAudioUrl = await generateSpeech(agentText, serverUrl);
+            console.log(`[${callSid}] - Step 3 SUCCESS: Speech generated.`);
+            twiml.play(agentAudioUrl);
+        } else {
+            twiml.say("I didn't quite catch that. Could you say it again?");
+        }
+    } catch (error) {
+        console.error(`[${callSid}] - AN ERROR OCCURRED:`, error);
+        twiml.say("I seem to be having a system malfunction. Please try again.");
+    }
+    twiml.record({ action: '/process-recording', playBeep: false });
+    res.type('text/xml');
+    res.send(twiml.toString());
 });
+
+app.listen(PORT, () => {
+    console.log(`Server is listening on port ${PORT}.`);
+});
+
