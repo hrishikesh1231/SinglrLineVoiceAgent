@@ -90,10 +90,13 @@ app.get('/start-call', (req, res) => {
         statusCallbackEvent: ['completed'],
     })
     .then(call => res.send(`Call initiated! SID: ${call.sid}`))
-    .catch(error => res.status(500).send(error));
+    .catch(error => {
+        console.error("Error starting call:", error);
+        res.status(500).send(error);
+    });
 });
 
-// THIS IS THE CORRECTED ROUTE
+// THIS IS THE CORRECTED ROUTE to accept both GET and POST requests
 app.all('/handle-call', (req, res) => {
     console.log(`Received a ${req.method} request for /handle-call. Proceeding with greeting.`);
     const twiml = new VoiceResponse();
@@ -120,6 +123,7 @@ app.post('/process-recording', async (req, res) => {
         console.error("An error occurred during processing:", error);
         twiml.say("I seem to be having a system malfunction. Please try again.");
     }
+    // Continue the conversation by listening for the next response
     twiml.record({ action: '/process-recording', playBeep: false });
     res.type('text/xml');
     res.send(twiml.toString());
@@ -136,3 +140,4 @@ app.post('/call-status', (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}.`);
 });
+
