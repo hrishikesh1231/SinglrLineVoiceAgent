@@ -1,4 +1,4 @@
-// index.js (Final Debugging Version)
+// index.js (Final, Corrected Version)
 
 require('dotenv').config();
 const express = require('express');
@@ -7,6 +7,7 @@ const fs = require('fs');
 const path = require('path');
 const OpenAI = require('openai');
 const { createClient } = require('@deepgram/sdk');
+const fetch = require('node-fetch'); // THE CRITICAL FIX IS ADDING THIS LINE
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // --- 1. Credentials and Clients ---
@@ -28,9 +29,25 @@ const conversationHistories = new Map();
 
 // --- 4. Helper Functions ---
 async function transcribeAudio(audioUrl) {
-    console.log("1. Transcribing audio with Deepgram...");
-    const response = await deepgram.listen.prerecorded.v("1").transcribeUrl(
-        { url: audioUrl },
+    console.log("1. Fetching audio from secure Twilio URL...");
+    const audioResponse = await fetch(audioUrl, {
+        headers: {
+            'Authorization': 'Basic ' + Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')
+        }
+    });
+
+    if (!audioResponse.ok) {
+        console.error(`Failed to fetch audio from Twilio. Status: ${audioResponse.status}`);
+        throw new Error('Could not retrieve recording from Twilio.');
+    }
+    
+    const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+    console.log(`   Fetched audio successfully. Size: ${audioBuffer.length} bytes.`);
+
+    console.log("2. Transcribing audio buffer with Deepgram...");
+    
+    const response = await deepgram.listen.prerecorded.v("1").transcribeFile(
+        audioBuffer,
         { model: "nova-2", smart_format: true }
     );
 
@@ -39,13 +56,13 @@ async function transcribeAudio(audioUrl) {
         console.log("   Transcription successful:", transcript);
         return transcript;
     } else {
-        console.warn("   Transcription result was empty. The user was likely silent.");
+        console.warn("   Transcription result was empty. The user was likely silent or ASR failed.");
         return "";
     }
 }
 
 async function getAgentResponse(text, callSid) {
-    console.log("2. Getting agent response from GPT-4o mini...");
+    console.log("3. Getting agent response from GPT-4o mini...");
     let history = conversationHistories.get(callSid) || [
         { role: 'system', content: 'You are a friendly and helpful voice agent. Keep responses concise.' }
     ];
@@ -61,7 +78,7 @@ async function getAgentResponse(text, callSid) {
 }
 
 async function generateSpeech(text) {
-    console.log("3. Generating speech with Deepgram Aura...");
+    console.log("4. Generating speech with Deepgram Aura...");
     const audioFileName = `response_${Date.now()}.mp3`;
     const publicDir = path.join(__dirname, 'public');
     if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
@@ -117,10 +134,7 @@ app.post('/process-recording', async (req, res) => {
     const twiml = new VoiceResponse();
     const recordingUrl = req.body.RecordingUrl;
     const callSid = req.body.CallSid;
-
-    // ADDED LOGGING: Let's see the exact recording URL Twilio is giving us.
     console.log(`[${callSid}] - Received recording. URL: ${recordingUrl}`);
-
     try {
         const userText = await transcribeAudio(recordingUrl);
         if (userText && userText.trim().length > 1) {
