@@ -1,4 +1,4 @@
-// index.js (Streaming Version - Final Fix)
+// index.js (Streaming Version - Final Robust Fix)
 
 require('dotenv').config();
 const express = require('express');
@@ -39,8 +39,6 @@ wss.on('connection', (ws) => {
         role: 'system',
         content: 'You are a funny, slightly sarcastic but friendly voice agent. You love telling jokes. Keep your responses concise and conversational.'
     }];
-    
-    let fullAgentResponse = "";
 
     deepgramLive.on('open', () => {
         console.log('Deepgram connection opened.');
@@ -51,26 +49,24 @@ wss.on('connection', (ws) => {
             if (transcript && data.is_final) {
                 console.log(`User said: "${transcript}"`);
                 conversationHistory.push({ role: 'user', content: transcript });
-                fullAgentResponse = "";
 
                 try {
+                    // UPDATED LOGIC: Get the full response from OpenAI first for reliability
                     const chatCompletion = await openai.chat.completions.create({
                         messages: conversationHistory,
                         model: "gpt-4o-mini",
-                        stream: true,
+                        // We are not streaming the response from OpenAI anymore
                     });
 
-                    for await (const chunk of chatCompletion) {
-                        const content = chunk.choices[0]?.delta?.content || "";
-                        if (content) {
-                            deepgramLive.speak(content);
-                            fullAgentResponse += content;
-                        }
-                    }
+                    const agentResponse = chatCompletion.choices[0].message.content;
 
-                    if (fullAgentResponse) {
-                        conversationHistory.push({ role: 'assistant', content: fullAgentResponse });
-                        console.log(`AI said: "${fullAgentResponse}"`);
+                    if (agentResponse) {
+                        conversationHistory.push({ role: 'assistant', content: agentResponse });
+                        console.log(`AI said: "${agentResponse}"`);
+                        
+                        // Speak the entire message at once
+                        console.log("Now sending full response to Deepgram TTS...");
+                        deepgramLive.speak(agentResponse);
                     }
 
                 } catch (error) {
@@ -114,15 +110,12 @@ wss.on('connection', (ws) => {
 });
 
 // --- 4. Express Routes ---
-// This is the webhook Twilio will call when someone dials your number
 app.post('/twilio-webhook', (req, res) => {
     console.log('--- Received a call on Twilio number. ---');
     const response = new VoiceResponse();
     
-    // THE CRITICAL FIX: Say the greeting first...
     response.say('Hello! You are connected to the funny AI agent. Please start speaking after this message.');
     
-    // ...THEN connect to the WebSocket stream.
     console.log('Connecting to WebSocket...');
     response.connect().stream({
         url: `${SERVER_BASE_URL.replace(/^http/, 'ws')}/`,
