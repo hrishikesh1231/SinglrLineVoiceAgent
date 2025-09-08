@@ -1,13 +1,12 @@
-// index.js (Final Hybrid Version)
+// index.js (Streaming Version - from YouTube tutorial)
 
 require('dotenv').config();
 const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
 const twilio = require('twilio');
-const fs = require('fs');
-const path = require('path');
 const OpenAI = require('openai');
 const { createClient } = require('@deepgram/sdk');
-const fetch = require('node-fetch');
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // --- 1. Credentials and Clients ---
@@ -17,141 +16,109 @@ const twilioClient = twilio(twilioAccountSid, twilioAuthToken);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-// --- 2. App Setup ---
+// --- 2. App and Server Setup ---
 const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static('public'));
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 const PORT = process.env.PORT || 3000;
 const SERVER_BASE_URL = process.env.SERVER_BASE_URL;
 
-// --- 3. State Management ---
-const conversationHistories = new Map();
+// --- 3. The Real-Time Conversation Engine (WebSocket Logic) ---
+wss.on('connection', (ws) => {
+    console.log('A new Twilio audio stream has connected.');
 
-// --- 4. Helper Functions ---
-async function transcribeAudio(audioUrl) {
-    console.log("1. Fetching audio from secure Twilio URL...");
-    const audioResponse = await fetch(audioUrl, {
-        headers: { 'Authorization': 'Basic ' + Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64') }
+    const deepgramLive = deepgram.listen.live({
+        model: 'nova-2',
+        language: 'en-US',
+        smart_format: true,
+        encoding: 'mulaw',
+        sample_rate: 8000,
     });
-    if (!audioResponse.ok) throw new Error(`Failed to fetch audio. Status: ${audioResponse.status}`);
-    const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
-    console.log(`   Fetched audio successfully. Now transcribing with Deepgram...`);
 
-    const response = await deepgram.listen.prerecorded.v("1").transcribeFile(
-        audioBuffer,
-        { model: "nova-2", smart_format: true }
-    );
-    
-    if (response.result && response.result.results && response.result.results.channels[0].alternatives[0]) {
-        const transcript = response.result.results.channels[0].alternatives[0].transcript;
-        console.log("   Transcription successful:", transcript);
-        return transcript;
-    } else {
-        console.warn("   Transcription result was empty.");
-        return "";
-    }
-}
+    let conversationHistory = [{
+        role: 'system',
+        content: 'You are a funny, slightly sarcastic but friendly voice agent. You love telling jokes. Keep your responses concise and conversational.'
+    }];
 
-async function getAgentResponse(text, callSid) {
-    console.log("2. Getting agent response from GPT-4o mini...");
-    let history = conversationHistories.get(callSid) || [
-        { role: 'system', content: 'You are a friendly and helpful voice agent. Keep responses concise.' }
-    ];
-    history.push({ role: 'user', content: text });
-    const chatCompletion = await openai.chat.completions.create({
-        messages: history,
-        model: "gpt-4o-mini",
+    deepgramLive.on('open', () => {
+        console.log('Deepgram connection opened.');
+
+        deepgramLive.on('transcript', async (data) => {
+            const transcript = data.channel.alternatives[0].transcript;
+            if (transcript && data.is_final) {
+                console.log(`User said: "${transcript}"`);
+                conversationHistory.push({ role: 'user', content: transcript });
+
+                const chatCompletion = await openai.chat.completions.create({
+                    messages: conversationHistory,
+                    model: "gpt-4o-mini",
+                });
+                const agentResponse = chatCompletion.choices[0].message.content;
+                conversationHistory.push({ role: 'assistant', content: agentResponse });
+                console.log(`AI said: "${agentResponse}"`);
+                
+                // Convert AI text to speech and stream back to Twilio
+                const audio = await deepgram.speak.request(
+                    { text: agentResponse },
+                    { model: "aura-asteria-en", encoding: "mulaw", sample_rate: 8000 }
+                );
+                const stream = await audio.getStream();
+                const reader = stream.getReader();
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    // Create the Twilio media message format
+                    const twilioMediaMessage = {
+                        event: 'media',
+                        streamSid: ws.streamSid, // The unique ID of this call's audio stream
+                        media: {
+                            payload: Buffer.from(value).toString('base64'),
+                        },
+                    };
+                    ws.send(JSON.stringify(twilioMediaMessage));
+                }
+            }
+        });
+
+        deepgramLive.on('close', () => console.log('Deepgram connection closed.'));
+        deepgramLive.on('error', (error) => console.error('Deepgram error:', error));
     });
-    const agentText = chatCompletion.choices[0].message.content;
-    history.push({ role: 'assistant', content: agentText });
-    conversationHistories.set(callSid, history);
-    return agentText;
-}
 
-async function generateSpeech(text) {
-    console.log("3. Generating speech with Deepgram Aura...");
-    const audioFileName = `response_${Date.now()}.mp3`;
-    const publicDir = path.join(__dirname, 'public');
-    if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
-    const speechFile = path.join(publicDir, audioFileName);
-    const response = await deepgram.speak.request({ text }, { model: "aura-asteria-en", encoding: "mp3" });
-    const stream = await response.getStream();
-    const buffer = await getAudioBuffer(stream);
-    await fs.promises.writeFile(speechFile, buffer);
-    const publicAudioUrl = `${SERVER_BASE_URL}/${audioFileName}`;
-    console.log("   Saved speech to:", publicAudioUrl);
-    return publicAudioUrl;
-}
+    ws.on('message', (message) => {
+        const twilioMessage = JSON.parse(message);
 
-async function getAudioBuffer(response) {
-    const reader = response.getReader();
-    const chunks = [];
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-    }
-    return Buffer.concat(chunks);
-}
-
-// --- 5. Express Routes ---
-app.get('/start-call', (req, res) => {
-    console.log(`--- Starting a new call using base URL: ${SERVER_BASE_URL} ---`);
-    twilioClient.calls.create({
-        url: `${SERVER_BASE_URL}/handle-call`,
-        to: process.env.YOUR_PHONE_NUMBER,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        statusCallback: `${SERVER_BASE_URL}/call-status`,
-        statusCallbackMethod: 'POST',
-        statusCallbackEvent: ['completed', 'failed', 'no-answer']
-    })
-    .then(call => res.send(`Call initiated! SID: ${call.sid}`))
-    .catch(error => {
-        console.error("Error starting call:", error);
-        res.status(500).send(error);
-    });
-});
-
-app.all('/handle-call', (req, res) => {
-    console.log(`Received a ${req.method} request for /handle-call. Proceeding with greeting.`);
-    const twiml = new VoiceResponse();
-    twiml.say({ voice: 'alice' }, 'Hello! You are connected to the agent. How can I help?');
-    twiml.record({ action: '/process-recording', playBeep: false });
-    res.type('text/xml');
-    res.send(twiml.toString());
-});
-
-app.post('/process-recording', async (req, res) => {
-    const twiml = new VoiceResponse();
-    const recordingUrl = req.body.RecordingUrl;
-    const callSid = req.body.CallSid;
-    try {
-        const userText = await transcribeAudio(recordingUrl);
-        if (userText && userText.trim().length > 0) {
-            const agentText = await getAgentResponse(userText, callSid);
-            const agentAudioUrl = await generateSpeech(agentText);
-            twiml.play(agentAudioUrl);
-        } else {
-            twiml.say("I didn't catch that, could you say it again?");
+        if (twilioMessage.event === 'start') {
+            ws.streamSid = twilioMessage.start.streamSid;
+            console.log(`Twilio stream started with SID: ${ws.streamSid}`);
         }
-    } catch (error) {
-        console.error(`[${callSid}] - An error occurred during processing:`, error);
-        twiml.say("I seem to be having a system malfunction. Please try again.");
-    }
-    twiml.record({ action: '/process-recording', playBeep: false });
+
+        if (twilioMessage.event === 'media') {
+            // Forward the raw audio from Twilio to Deepgram
+            deepgramLive.send(Buffer.from(twilioMessage.media.payload, 'base64'));
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('Twilio stream connection closed.');
+        deepgramLive.finish();
+    });
+});
+
+// --- 4. Express Routes ---
+
+// This is the webhook Twilio will call when someone dials your number
+app.post('/twilio-webhook', (req, res) => {
+    console.log('--- Received a call on Twilio number. Connecting to WebSocket... ---');
+    const response = new VoiceResponse();
+    // Instruct Twilio to start a bi-directional audio stream to our WebSocket server
+    response.connect().stream({
+        url: `${SERVER_BASE_URL.replace(/^http/, 'ws')}/`,
+    });
     res.type('text/xml');
-    res.send(twiml.toString());
+    res.send(response.toString());
 });
 
-app.post('/call-status', (req, res) => {
-    const callSid = req.body.CallSid;
-    console.log(`--- Call ${callSid} has ended with status: ${req.body.CallStatus}. Cleaning up history. ---`);
-    conversationHistories.delete(callSid);
-    res.sendStatus(200);
+// --- 5. Start the Server ---
+server.listen(PORT, () => {
+    console.log(`Server and WebSocket are listening on port ${PORT}.`);
 });
-
-// --- 6. Start the Server ---
-app.listen(PORT, () => {
-    console.log(`Server is listening on port ${PORT}.`);
-});
-
