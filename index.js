@@ -1,127 +1,201 @@
-import express from "express";
-import bodyParser from "body-parser";
-import fetch from "node-fetch";
-import Twilio from "twilio";
-import dotenv from "dotenv";
+// index.js — Real-time AI Voice Agent (Fixed)
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const WebSocket = require('ws');
+const twilio = require('twilio');
+const OpenAI = require('openai');
+const { createClient } = require('@deepgram/sdk');
+const VoiceResponse = twilio.twiml.VoiceResponse;
 
-dotenv.config();
-const app = express();
+const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
+const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
+const twilioClient = twilio(twilioAccountSid, twilioAuthToken);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
+
+const SERVER_BASE_URL = process.env.SERVER_BASE_URL;
 const PORT = process.env.PORT || 3000;
 
-// Twilio setup
-const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static('public'));
 
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+// Conversation Memory
+const conversationHistories = new Map();
 
-/**
- * STEP 1 - Handle incoming call
- */
-app.post("/voice", (req, res) => {
-  const twiml = new Twilio.twiml.VoiceResponse();
-
-  twiml.say("Hey Hrishikesh! I'm your AI voice agent. How are you doing today?");
-  twiml.gather({
-    input: "speech",
-    action: "/handle-call",
-    method: "POST",
-    timeout: 5,
-  });
-
-  res.type("text/xml");
-  res.send(twiml.toString());
+// === 1. Start Call ===
+app.get('/start-call', async (req, res) => {
+    try {
+        const call = await twilioClient.calls.create({
+            url: `${SERVER_BASE_URL}/handle-call`,
+            to: process.env.YOUR_PHONE_NUMBER,
+            from: process.env.TWILIO_PHONE_NUMBER,
+            statusCallback: `${SERVER_BASE_URL}/call-status`,
+            statusCallbackMethod: 'POST',
+            statusCallbackEvent: ['completed', 'failed', 'no-answer']
+        });
+        res.send(`✅ Call started! SID: ${call.sid}`);
+    } catch (err) {
+        console.error('❌ Error starting call:', err);
+        res.status(500).send(err.message);
+    }
 });
 
-/**
- * STEP 2 - Handle AI conversation
- */
-app.post("/handle-call", async (req, res) => {
-  const twiml = new Twilio.twiml.VoiceResponse();
+// === 2. Handle Incoming Call ===
+app.post('/handle-call', (req, res) => {
+    const twiml = new VoiceResponse();
 
-  try {
-    const recordingUrl = req.body.RecordingUrl;
-
-    if (!recordingUrl) {
-      twiml.say("I didn't hear anything. Could you please repeat?");
-      twiml.redirect("/voice");
-      res.type("text/xml");
-      return res.send(twiml.toString());
-    }
-
-    // STEP 2.1 - Transcribe audio using Deepgram
-    const transcript = await transcribeWithDeepgram(recordingUrl);
-
-    if (!transcript) {
-      twiml.say("Sorry, I couldn’t understand you. Could you please repeat?");
-      twiml.redirect("/voice");
-      res.type("text/xml");
-      return res.send(twiml.toString());
-    }
-
-    console.log("User said:", transcript);
-
-    // STEP 2.2 - Get AI response
-    const aiResponse = await generateAIResponse(transcript);
-
-    twiml.say(aiResponse);
-
-    // Continue the conversation
-    twiml.gather({
-      input: "speech",
-      action: "/handle-call",
-      method: "POST",
-      timeout: 5,
+    // ✅ Enable live media streaming
+    twiml.start().stream({
+        url: `${SERVER_BASE_URL}/media-stream`,
+        track: "inbound_track"
     });
 
-    res.type("text/xml");
+    // ✅ Greeting
+    twiml.say({ voice: 'Polly.Joanna' }, "Hello Hrishi! I'm your AI assistant. Let's talk live!");
+
+    // ✅ Keep call alive indefinitely
+    twiml.pause({ length: 300 }); // 5 minutes timeout
+
+    res.type('text/xml');
     res.send(twiml.toString());
-  } catch (error) {
-    console.error("Error in /handle-call:", error);
-    twiml.say("Oops! Something went wrong, let's try again.");
-    twiml.redirect("/voice");
-    res.type("text/xml");
-    res.send(twiml.toString());
-  }
 });
 
-/**
- * STEP 3 - Deepgram Transcription Function
- */
-async function transcribeWithDeepgram(audioUrl) {
-  try {
-    const response = await fetch("https://api.deepgram.com/v1/listen", {
-      method: "POST",
-      headers: {
-        Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ url: audioUrl }),
+// === 3. Call Status Cleanup ===
+app.post('/call-status', (req, res) => {
+    const callSid = req.body.CallSid;
+    console.log(`📞 Call ${callSid} ended. Cleaning up memory.`);
+    conversationHistories.delete(callSid);
+    res.sendStatus(200);
+});
+
+// === 4. WebSocket Upgrade ===
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+    if (req.url === '/media-stream') {
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit('connection', ws, req);
+        });
+    } else {
+        socket.destroy();
+    }
+});
+
+// === 5. WebSocket Handler ===
+wss.on('connection', async (ws, req) => {
+    console.log("🔗 Twilio connected to media stream");
+
+    // --- Connect to Deepgram Live ---
+    const dgLive = deepgram.listen.live({
+        model: "nova-2",
+        encoding: "mulaw",
+        sample_rate: 8000,
+        interim_results: true
     });
 
-    const data = await response.json();
-    return data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || null;
-  } catch (error) {
-    console.error("Deepgram transcription failed:", error);
-    return null;
-  }
+    dgLive.addListener("open", () => console.log("✅ Connected to Deepgram Live"));
+
+    // === When transcript received ===
+    dgLive.addListener("transcriptReceived", async (dgMsg) => {
+        const transcript = dgMsg.channel.alternatives[0].transcript;
+
+        if (transcript && transcript.trim() !== "") {
+            console.log(`👤 User: ${transcript}`);
+
+            // Get AI response from GPT
+            const agentReply = await getAgentResponse(transcript, "call-1");
+
+            // Generate speech via Deepgram
+            const audioUrl = await generateSpeech(agentReply);
+
+            if (audioUrl) {
+                // Send back audio instantly
+                ws.send(JSON.stringify({
+                    event: 'media',
+                    media: { payload: audioUrl }
+                }));
+
+                console.log(`🤖 Agent: ${agentReply}`);
+            }
+        }
+    });
+
+    // === Receive audio chunks from Twilio ===
+    ws.on('message', (msg) => {
+        const data = JSON.parse(msg);
+        if (data.event === "media" && data.media && data.media.payload) {
+            dgLive.send(data.media.payload);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log("❌ WebSocket closed, stopping Deepgram stream");
+        dgLive.finish();
+    });
+});
+
+// === 6. GPT Response ===
+async function getAgentResponse(userText, callSid) {
+    let history = conversationHistories.get(callSid) || [
+        { role: 'system', content: 'You are a friendly AI voice agent. Keep responses short and natural.' }
+    ];
+
+    history.push({ role: 'user', content: userText });
+
+    const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: history
+    });
+
+    const agentText = completion.choices[0].message.content;
+    history.push({ role: 'assistant', content: agentText });
+    conversationHistories.set(callSid, history);
+
+    return agentText;
 }
 
-/**
- * STEP 4 - AI Response Generator
- */
-async function generateAIResponse(query) {
-  // Using HuggingFace free model
-  const response = await fetch("https://api-inference.huggingface.co/models/facebook/blenderbot-400M-distill", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ inputs: query }),
-  });
+// === 7. Deepgram TTS ===
+async function generateSpeech(text) {
+    try {
+        const response = await deepgram.speak.request(
+            { text },
+            { model: "aura-asteria-en", encoding: "mp3" }
+        );
 
-  const data = await response.json();
-  return data?.generated_text || "I'm not sure how to respond to that.";
+        const stream = await response.getStream();
+        const buffer = await getAudioBuffer(stream);
+
+        const fileName = `response_${Date.now()}.mp3`;
+        const publicDir = path.join(__dirname, 'public');
+        if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
+
+        const speechFile = path.join(publicDir, fileName);
+        await fs.promises.writeFile(speechFile, buffer);
+
+        return `${SERVER_BASE_URL}/${fileName}`;
+    } catch (err) {
+        console.error("❌ TTS Error:", err);
+        return null;
+    }
 }
 
-app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
+async function getAudioBuffer(response) {
+    const reader = response.getReader();
+    const chunks = [];
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+    }
+    return Buffer.concat(chunks);
+}
+
+// === 8. Start Server ===
+server.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+});
