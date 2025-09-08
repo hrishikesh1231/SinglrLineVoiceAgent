@@ -44,8 +44,11 @@ app.get('/start-call', async (req, res) => {
                         }
                     ]
                 },
-                // Vapi has its own library of high-quality, low-latency voices.
-                voice: 'onyx-openai', // FIX: Changed from 'jennifer-neural' to a valid voice
+                // THE CRITICAL FIX: Use an object for third-party voices
+                voice: {
+                    provider: 'openai',
+                    voiceId: 'onyx' // Specify the provider and the voice ID separately
+                },
                 firstMessage: 'Hello! You are connected to the Vapi agent. How can I help you today?'
             }
         }, {
@@ -67,4 +70,16 @@ app.get('/start-call', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}.`);
 });
+```
+
+### Summary of the Fix
+
+* **Old Code:** `voice: 'onyx-openai'` (A simple string)
+* **New Code:**
+    ```javascript
+    voice: {
+        provider: 'openai',
+        voiceId: 'onyx'
+    }
+    
 
