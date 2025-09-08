@@ -33,7 +33,16 @@ async function transcribeAudio(audioUrl) {
         { url: audioUrl },
         { model: "nova-2", smart_format: true }
     );
-    return response.result.results.channels[0].alternatives[0].transcript;
+
+    // FIX: Add a defensive check to handle silent/empty recordings gracefully.
+    if (response.result && response.result.results && response.result.results.channels[0].alternatives[0]) {
+        const transcript = response.result.results.channels[0].alternatives[0].transcript;
+        console.log("   Transcription successful:", transcript);
+        return transcript;
+    } else {
+        console.warn("   Transcription result was empty. The user was likely silent.");
+        return ""; // Return an empty string if transcription fails or is empty
+    }
 }
 
 async function getAgentResponse(text, callSid) {
