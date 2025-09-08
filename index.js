@@ -51,26 +51,33 @@ async function transcribeAudio(audioUrl) {
 }
 
 // 2. Language Model Response using OpenAI GPT-4o mini
+// In your getAgentResponse function
+
 async function getAgentResponse(text, callSid) {
-    console.log("2. Getting agent response from GPT-4o mini...");
+    console.log("-> Getting agent response from GPT-4o mini...");
     let history = conversationHistories.get(callSid) || [
-        // The system message is a powerful way to define the AI's personality and goals
-        { role: 'system', content: 'You are a funny, slightly sarcastic but friendly voice agent. Keep your responses short and conversational, suitable for a phone call.' }
+        { 
+            role: 'system', 
+            // 1. A more forceful prompt for speed and brevity
+            content: 'You are a friendly but extremely brief voice agent. Your goal is speed. Keep all responses under 20 words. Do not use filler phrases.' 
+        }
     ];
     history.push({ role: 'user', content: text });
 
     const chatCompletion = await openai.chat.completions.create({
         messages: history,
-        model: "gpt-4o-mini", // A fast, intelligent, and cost-effective new model
+        model: "gpt-4o-mini",
+        // 2. Add a hard limit on the response length
+        max_tokens: 40 
     });
 
+    // ... rest of the function is the same
     const agentText = chatCompletion.choices[0].message.content;
     history.push({ role: 'assistant', content: agentText });
     conversationHistories.set(callSid, history);
     console.log("   Agent response:", agentText);
     return agentText;
 }
-
 // 3. Text-to-Speech using OpenAI TTS
 async function generateSpeech(text, serverUrl) {
     console.log("3. Generating speech with OpenAI TTS...");
