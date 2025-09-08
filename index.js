@@ -115,7 +115,8 @@ app.get('/start-call', (req, res) => {
     .catch(error => res.status(500).send(error));
 });
 
-app.post('/handle-call', (req, res) => {
+app.all('/handle-call', (req, res) => { // CHANGED THIS LINE from app.post to app.all
+    console.log(`Received a ${req.method} request for /handle-call`); // Added extra logging for debugging
     const twiml = new VoiceResponse();
     twiml.say({ voice: 'alice' }, 'Hello! You are connected to the OpenAI agent. What would you like to talk about?');
     twiml.record({ action: '/process-recording', playBeep: false });
