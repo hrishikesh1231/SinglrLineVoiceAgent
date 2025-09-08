@@ -45,7 +45,7 @@ app.get('/start-call', async (req, res) => {
                     ]
                 },
                 // Vapi has its own library of high-quality, low-latency voices.
-                voice: 'jennifer-neural', 
+                voice: 'onyx-openai', // FIX: Changed from 'jennifer-neural' to a valid voice
                 firstMessage: 'Hello! You are connected to the Vapi agent. How can I help you today?'
             }
         }, {
