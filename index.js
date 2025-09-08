@@ -1,110 +1,115 @@
-// index.js (Optimized Free Version)
 
 require('dotenv').config();
 const express = require('express');
 const twilio = require('twilio');
-const fetch = require('node-fetch');
-const VoiceResponse = twilio.twiml.VoiceResponse;
 const fs = require('fs');
 const path = require('path');
+const OpenAI = require('openai'); // Import the official OpenAI library
+const VoiceResponse = twilio.twiml.VoiceResponse;
 
-// --- Credentials and Clients ---
-const huggingFaceToken = process.env.HUGGING_FACE_TOKEN;
+// --- 1. Credentials and Clients ---
 const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const twilioClient = twilio(twilioAccountSid, twilioAuthToken);
 
-// --- App Setup ---
+// Initialize the OpenAI client with your new API key
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+});
+
+// --- 2. App Setup ---
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public')); 
 const PORT = process.env.PORT || 3000;
 
-// --- OPTIMIZED Hugging Face API Endpoints ---
-// These models are smaller and much faster to load on the free tier.
-const STT_API_URL = "https://api-inference.huggingface.co/models/openai/whisper-base"; // Smaller, faster Whisper
-const LLM_API_URL = "https://api-inference.huggingface.co/models/google/gemma-2b-it";   // A fast, high-quality model from Google
-const TTS_API_URL = "https://api-inference.huggingface.co/models/espnet/kan-bayashi_ljspeech_vits";
-
-// --- State Management for Conversation History ---
+// --- 3. State Management ---
+// This part remains the same, to handle conversation history for each call
 const conversationHistories = new Map();
 
-// --- API Helper Functions (Adjusted for new models) ---
+// --- 4. NEW OpenAI-Powered Helper Functions ---
 
+// 1. Speech-to-Text using OpenAI Whisper
 async function transcribeAudio(audioUrl) {
-    console.log("1. Transcribing audio with whisper-base...");
-    const audioResponse = await fetch(audioUrl);
-    const audioBlob = await audioResponse.blob();
-    const response = await fetch(STT_API_URL, {
-        headers: { Authorization: `Bearer ${huggingFaceToken}` },
-        method: "POST",
-        body: audioBlob,
+    console.log("1. Transcribing audio with OpenAI Whisper...");
+    // The OpenAI library needs the raw audio file, so we must fetch it from Twilio's URL first.
+    // Twilio protects its recording URLs, so we must authenticate.
+    const audioResponse = await fetch(audioUrl, {
+        headers: {
+            'Authorization': 'Basic ' + Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')
+        }
     });
-    const result = await response.json();
-    if (result.error) throw new Error(result.error);
-    console.log("   Transcription result:", result.text);
-    return result.text;
+    const audioBlob = await audioResponse.blob();
+
+    // Now, we send the audio file to OpenAI for transcription
+    const transcription = await openai.audio.transcriptions.create({
+        file: await OpenAI.toFile(audioBlob, 'audio.wav'), // Convert the audio blob to a file format OpenAI understands
+        model: "whisper-1",
+    });
+    console.log("   Transcription result:", transcription.text);
+    return transcription.text;
 }
 
+// 2. Language Model Response using OpenAI GPT-4o mini
 async function getAgentResponse(text, callSid) {
-    console.log("2. Getting agent response with gemma-2b-it...");
-    let history = conversationHistories.get(callSid) || [];
+    console.log("2. Getting agent response from GPT-4o mini...");
+    let history = conversationHistories.get(callSid) || [
+        // The system message is a powerful way to define the AI's personality and goals
+        { role: 'system', content: 'You are a funny, slightly sarcastic but friendly voice agent. Keep your responses short and conversational, suitable for a phone call.' }
+    ];
     history.push({ role: 'user', content: text });
 
-    // Gemma model uses a specific prompt format
-    const prompt = `<start_of_turn>user\nYou are a funny, slightly sarcastic but friendly voice agent. Keep your responses short and conversational. The user just said: ${text}<end_of_turn>\n<start_of_turn>model\n`;
-
-    const response = await fetch(LLM_API_URL, {
-        headers: { Authorization: `Bearer ${huggingFaceToken}`, "Content-Type": "application/json" },
-        method: "POST",
-        body: JSON.stringify({
-            inputs: prompt,
-            parameters: { max_new_tokens: 75, return_full_text: false }
-        }),
+    const chatCompletion = await openai.chat.completions.create({
+        messages: history,
+        model: "gpt-4o-mini", // A fast, intelligent, and cost-effective new model
     });
-    const result = await response.json();
-    if (result.error) throw new Error(result.error);
-    let agentText = result[0].generated_text.trim() || "I'm not sure what to say.";
-    
+
+    const agentText = chatCompletion.choices[0].message.content;
     history.push({ role: 'assistant', content: agentText });
     conversationHistories.set(callSid, history);
     console.log("   Agent response:", agentText);
     return agentText;
 }
 
+// 3. Text-to-Speech using OpenAI TTS
 async function generateSpeech(text, serverUrl) {
-    console.log("3. Generating speech...");
+    console.log("3. Generating speech with OpenAI TTS...");
     const audioFileName = `response_${Date.now()}.mp3`;
     const publicDir = path.join(__dirname, 'public');
-    if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
-    const speechFile = path.join(publicDir, audioFileName);
-    
-    const response = await fetch(TTS_API_URL, {
-        headers: { Authorization: `Bearer ${huggingFaceToken}`, "Content-Type": "application/json" },
-        method: "POST",
-        body: JSON.stringify({ inputs: text }),
-    });
-    if (!response.ok) {
-        const errorBody = await response.text();
-        throw new Error(`TTS API failed with status ${response.status}: ${errorBody}`);
+    if (!fs.existsSync(publicDir)) {
+        fs.mkdirSync(publicDir);
     }
-    const audioBlob = await response.blob();
-    const buffer = Buffer.from(await audioBlob.arrayBuffer());
+    const speechFile = path.join(publicDir, audioFileName);
+
+    // Generate the speech audio and get the result as a buffer
+    const mp3 = await openai.audio.speech.create({
+        model: "tts-1",
+        voice: "alloy", // You can try other voices like 'echo', 'fable', 'onyx', 'nova', 'shimmer'
+        input: text,
+    });
+    
+    // Write the audio buffer to a file in our 'public' directory
+    const buffer = Buffer.from(await mp3.arrayBuffer());
     await fs.promises.writeFile(speechFile, buffer);
     
+    // Return the public URL to this new audio file
     const publicAudioUrl = `${serverUrl}/${audioFileName}`;
     console.log("   Saved speech to:", publicAudioUrl);
     return publicAudioUrl;
 }
 
-// --- Express Routes ---
+// --- 5. Express Routes (These do not need to change) ---
+// The logic of the routes remains the same; they just call our new OpenAI helper functions.
 app.get('/start-call', (req, res) => {
     const serverUrl = req.protocol + '://' + req.get('host');
     console.log(`--- Starting a new call using base URL: ${serverUrl} ---`);
     twilioClient.calls.create({
         url: `${serverUrl}/handle-call`,
         to: process.env.YOUR_PHONE_NUMBER,
-        from: process.env.TWILIO_PHONE_NUMBER
+        from: process.env.TWILIO_PHONE_NUMBER,
+        statusCallback: `${serverUrl}/call-status`,
+        statusCallbackMethod: 'POST',
+        statusCallbackEvent: ['completed'],
     })
     .then(call => res.send(`Call initiated! SID: ${call.sid}`))
     .catch(error => res.status(500).send(error));
@@ -112,8 +117,8 @@ app.get('/start-call', (req, res) => {
 
 app.post('/handle-call', (req, res) => {
     const twiml = new VoiceResponse();
-    twiml.say({ voice: 'alice' }, 'Hello there! Connecting to the agent. Please tell me something after the beep.');
-    twiml.record({ action: '/process-recording', playBeep: true });
+    twiml.say({ voice: 'alice' }, 'Hello! You are connected to the OpenAI agent. What would you like to talk about?');
+    twiml.record({ action: '/process-recording', playBeep: false });
     res.type('text/xml');
     res.send(twiml.toString());
 });
@@ -124,24 +129,16 @@ app.post('/process-recording', async (req, res) => {
     const callSid = req.body.CallSid;
     const serverUrl = req.protocol + '://' + req.get('host');
     try {
-        console.log(`[${callSid}] - Step 1: Starting transcription...`);
         const userText = await transcribeAudio(recordingUrl);
-        console.log(`[${callSid}] - Step 1 SUCCESS: Transcription received.`);
-
         if (userText && userText.trim().length > 1) {
-            console.log(`[${callSid}] - Step 2: Getting agent response...`);
             const agentText = await getAgentResponse(userText, callSid);
-            console.log(`[${callSid}] - Step 2 SUCCESS: Agent response received.`);
-
-            console.log(`[${callSid}] - Step 3: Generating speech...`);
             const agentAudioUrl = await generateSpeech(agentText, serverUrl);
-            console.log(`[${callSid}] - Step 3 SUCCESS: Speech generated.`);
             twiml.play(agentAudioUrl);
         } else {
-            twiml.say("I didn't quite catch that. Could you say it again?");
+            twiml.say("I didn't catch that, could you say it again?");
         }
     } catch (error) {
-        console.error(`[${callSid}] - AN ERROR OCCURRED:`, error);
+        console.error("An error occurred during processing:", error);
         twiml.say("I seem to be having a system malfunction. Please try again.");
     }
     twiml.record({ action: '/process-recording', playBeep: false });
@@ -149,8 +146,14 @@ app.post('/process-recording', async (req, res) => {
     res.send(twiml.toString());
 });
 
+app.post('/call-status', (req, res) => {
+    const callSid = req.body.CallSid;
+    console.log(`--- Call ${callSid} has ended. Cleaning up history. ---`);
+    conversationHistories.delete(callSid);
+    res.sendStatus(200);
+});
+
+// --- 6. Start the Server ---
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}.`);
 });
-
-
