@@ -1,3 +1,4 @@
+// index.js (with Deepgram for Low Latency)
 
 require('dotenv').config();
 const express = require('express');
@@ -35,14 +36,18 @@ const conversationHistories = new Map();
 // 1. Transcription with Deepgram (Faster)
 async function transcribeAudio(audioUrl) {
     console.log("1. Transcribing audio with Deepgram...");
-    const response = await deepgram.listen.prerecorded.v("1").transcribeUrl(
-        { url: audioUrl },
-        // Nova-2 is one of the fastest and most accurate models
-        { model: "nova-2", smart_format: true }
-    );
-    const transcript = response.result.results.channels[0].alternatives[0].transcript;
-    console.log("   Transcription result:", transcript);
-    return transcript;
+    try {
+        const response = await deepgram.listen.prerecorded.v("1").transcribeUrl(
+            { url: audioUrl },
+            { model: "nova-2", smart_format: true }
+        );
+        const transcript = response.result.results.channels[0].alternatives[0].transcript;
+        console.log("   Transcription result:", transcript);
+        return transcript;
+    } catch (error) {
+        console.error("DEEPGRAM TRANSCRIPTION ERROR:", error);
+        throw error; // Propagate the error to be caught in the main route
+    }
 }
 
 // 2. Thinking with OpenAI (This function remains the same)
@@ -73,21 +78,23 @@ async function generateSpeech(text, serverUrl) {
     if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir);
     const speechFile = path.join(publicDir, audioFileName);
 
-    // Request the audio from Deepgram's fast Aura model
-    const response = await deepgram.speak.request(
-        { text },
-        { model: "aura-asteria-en", encoding: "mp3" }
-    );
-    
-    // Get the audio data as a stream and convert it to a buffer
-    const stream = await response.getStream();
-    const buffer = await getAudioBuffer(stream);
+    try {
+        const response = await deepgram.speak.request(
+            { text },
+            { model: "aura-asteria-en", encoding: "mp3" }
+        );
+        
+        const stream = await response.getStream();
+        const buffer = await getAudioBuffer(stream);
 
-    // Save the audio file
-    await fs.promises.writeFile(speechFile, buffer);
-    const publicAudioUrl = `${serverUrl}/${audioFileName}`;
-    console.log("   Saved speech to:", publicAudioUrl);
-    return publicAudioUrl;
+        await fs.promises.writeFile(speechFile, buffer);
+        const publicAudioUrl = `${serverUrl}/${audioFileName}`;
+        console.log("   Saved speech to:", publicAudioUrl);
+        return publicAudioUrl;
+    } catch (error) {
+        console.error("DEEPGRAM TTS ERROR:", error);
+        throw error; // Propagate the error
+    }
 }
 
 // Helper function to handle Deepgram's audio stream
@@ -121,7 +128,6 @@ app.get('/start-call', (req, res) => {
 
 app.post('/handle-call', (req, res) => {
     const twiml = new VoiceResponse();
-    // Updated greeting to reflect the new, faster agent
     twiml.say({ voice: 'alice' }, 'Hello! You are connected to the upgraded agent. How can I help?');
     twiml.record({ action: '/process-recording', playBeep: false });
     res.type('text/xml');
@@ -136,7 +142,7 @@ app.post('/process-recording', async (req, res) => {
     try {
         const userText = await transcribeAudio(recordingUrl);
         if (userText && userText.trim().length > 1) {
-            const agentText = await getAgentResponse(userText, callSid);
+            const agentText = await getAgent_response(userText, callSid);
             const agentAudioUrl = await generateSpeech(agentText, serverUrl);
             twiml.play(agentAudioUrl);
         } else {
@@ -162,3 +168,4 @@ app.post('/call-status', (req, res) => {
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}.`);
 });
+
