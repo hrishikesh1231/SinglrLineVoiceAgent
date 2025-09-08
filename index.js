@@ -1,4 +1,4 @@
-// index.js (Final, Corrected Version)
+// index.js (Final Debugging Version)
 
 require('dotenv').config();
 const express = require('express');
@@ -34,14 +34,13 @@ async function transcribeAudio(audioUrl) {
         { model: "nova-2", smart_format: true }
     );
 
-    // FIX: Add a defensive check to handle silent/empty recordings gracefully.
     if (response.result && response.result.results && response.result.results.channels[0].alternatives[0]) {
         const transcript = response.result.results.channels[0].alternatives[0].transcript;
         console.log("   Transcription successful:", transcript);
         return transcript;
     } else {
         console.warn("   Transcription result was empty. The user was likely silent.");
-        return ""; // Return an empty string if transcription fails or is empty
+        return "";
     }
 }
 
@@ -105,7 +104,6 @@ app.get('/start-call', (req, res) => {
     });
 });
 
-// THIS IS THE CORRECTED ROUTE to accept both GET and POST requests
 app.all('/handle-call', (req, res) => {
     console.log(`Received a ${req.method} request for /handle-call. Proceeding with greeting.`);
     const twiml = new VoiceResponse();
@@ -119,6 +117,10 @@ app.post('/process-recording', async (req, res) => {
     const twiml = new VoiceResponse();
     const recordingUrl = req.body.RecordingUrl;
     const callSid = req.body.CallSid;
+
+    // ADDED LOGGING: Let's see the exact recording URL Twilio is giving us.
+    console.log(`[${callSid}] - Received recording. URL: ${recordingUrl}`);
+
     try {
         const userText = await transcribeAudio(recordingUrl);
         if (userText && userText.trim().length > 1) {
@@ -129,10 +131,9 @@ app.post('/process-recording', async (req, res) => {
             twiml.say("I didn't catch that, could you say it again?");
         }
     } catch (error) {
-        console.error("An error occurred during processing:", error);
+        console.error(`[${callSid}] - An error occurred during processing:`, error);
         twiml.say("I seem to be having a system malfunction. Please try again.");
     }
-    // Continue the conversation by listening for the next response
     twiml.record({ action: '/process-recording', playBeep: false });
     res.type('text/xml');
     res.send(twiml.toString());
