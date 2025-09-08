@@ -1,4 +1,4 @@
-// index.js (Deepgram Hybrid Version)
+// index.js (Deepgram + Twilio + OpenAI Hybrid Voice Agent)
 
 require('dotenv').config();
 const express = require('express');
@@ -7,7 +7,8 @@ const fs = require('fs');
 const path = require('path');
 const OpenAI = require('openai');
 const { createClient } = require('@deepgram/sdk');
-const fetch = require('node-fetch'); // Required for fetching audio from Twilio
+const fetch = require('node-fetch');
+const bodyParser = require('body-parser');
 const VoiceResponse = twilio.twiml.VoiceResponse;
 
 // --- 1. Credentials and Clients ---
@@ -19,7 +20,8 @@ const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
 // --- 2. App Setup ---
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+app.use(bodyParser.urlencoded({ extended: true })); // For Twilio webhook form data
+app.use(bodyParser.json());
 app.use(express.static('public'));
 const PORT = process.env.PORT || 3000;
 const SERVER_BASE_URL = process.env.SERVER_BASE_URL;
@@ -29,7 +31,7 @@ const conversationHistories = new Map();
 
 // --- 4. Helper Functions ---
 
-// 1. Transcription with Deepgram (Securely downloads audio first)
+// 1. Transcription with Deepgram
 async function transcribeAudio(audioUrl) {
     console.log("1. Fetching audio from secure Twilio URL...");
     const audioResponse = await fetch(audioUrl, {
@@ -49,29 +51,33 @@ async function transcribeAudio(audioUrl) {
         console.log("   Transcription successful:", transcript);
         return transcript;
     } else {
-        console.warn("   Transcription result was empty. This is likely due to silent audio or an API key issue.");
+        console.warn("   Transcription result was empty.");
         return "";
     }
 }
 
-// 2. Thinking with OpenAI
+// 2. AI Response with OpenAI
 async function getAgentResponse(text, callSid) {
-    console.log("2. Getting agent response from GPT-4o mini...");
+    console.log("2. Getting agent response from GPT-4o-mini...");
     let history = conversationHistories.get(callSid) || [
-        { role: 'system', content: 'You are a funny, slightly sarcastic but friendly voice agent. Keep responses concise.' }
+        { role: 'system', content: 'You are a funny, slightly sarcastic but friendly AI voice agent. Keep responses short.' }
     ];
     history.push({ role: 'user', content: text });
+
     const chatCompletion = await openai.chat.completions.create({
         messages: history,
         model: "gpt-4o-mini",
     });
+
     const agentText = chatCompletion.choices[0].message.content;
     history.push({ role: 'assistant', content: agentText });
     conversationHistories.set(callSid, history);
+
+    console.log("   AI says:", agentText);
     return agentText;
 }
 
-// 3. Text-to-Speech with Deepgram
+// 3. Optional: Deepgram TTS (if you want better voices)
 async function generateSpeech(text) {
     console.log("3. Generating speech with Deepgram Aura...");
     const audioFileName = `response_${Date.now()}.mp3`;
@@ -99,6 +105,8 @@ async function getAudioBuffer(response) {
 }
 
 // --- 5. Express Routes ---
+
+// Start a call
 app.get('/start-call', (req, res) => {
     console.log(`--- Starting a new call using base URL: ${SERVER_BASE_URL} ---`);
     twilioClient.calls.create({
@@ -116,46 +124,66 @@ app.get('/start-call', (req, res) => {
     });
 });
 
+// Handle initial greeting
 app.all('/handle-call', (req, res) => {
-    console.log(`Received a ${req.method} request for /handle-call. Proceeding with greeting.`);
+    console.log(`Received a ${req.method} request for /handle-call.`);
     const twiml = new VoiceResponse();
-    twiml.say({ voice: 'alice' }, 'Hello! You are connected to the agent. How can I help?');
-    twiml.record({ action: '/process-recording', playBeep: false });
+    twiml.say({ voice: 'alice' }, 'Hello! I am your AI assistant. How can I help?');
+    twiml.record({
+        action: '/process-recording',
+        playBeep: false,
+        timeout: 3,
+        maxLength: 10,
+        transcribe: false
+    });
     res.type('text/xml');
     res.send(twiml.toString());
 });
 
+// Handle user recording + AI reply
 app.post('/process-recording', async (req, res) => {
     const twiml = new VoiceResponse();
     const recordingUrl = req.body.RecordingUrl;
     const callSid = req.body.CallSid;
+
     try {
         const userText = await transcribeAudio(recordingUrl);
+
         if (userText && userText.trim().length > 0) {
             const agentText = await getAgentResponse(userText, callSid);
-            const agentAudioUrl = await generateSpeech(agentText);
-            twiml.play(agentAudioUrl);
+
+            // Use Twilio <Say> for instant response
+            twiml.say({ voice: 'Polly.Joanna' }, agentText);
         } else {
-            twiml.say("I didn't catch that, could you say it again?");
+            twiml.say("I didn't catch that, could you repeat?");
         }
     } catch (error) {
-        console.error(`[${callSid}] - An error occurred during processing:`, error);
-        twiml.say("I seem to be having a system malfunction. Please try again.");
+        console.error(`[${callSid}] - Error:`, error);
+        twiml.say("Oops! I had a problem understanding you. Let's try again.");
     }
-    twiml.record({ action: '/process-recording', playBeep: false });
+
+    // Wait for next input
+    twiml.record({
+        action: '/process-recording',
+        playBeep: false,
+        timeout: 3,
+        maxLength: 10,
+        transcribe: false
+    });
+
     res.type('text/xml');
     res.send(twiml.toString());
 });
 
+// Handle call end
 app.post('/call-status', (req, res) => {
     const callSid = req.body.CallSid;
-    console.log(`--- Call ${callSid} has ended with status: ${req.body.CallStatus}. Cleaning up history. ---`);
+    console.log(`--- Call ${callSid} ended with status: ${req.body.CallStatus}. Cleaning up history. ---`);
     conversationHistories.delete(callSid);
     res.sendStatus(200);
 });
 
 // --- 6. Start the Server ---
 app.listen(PORT, () => {
-    console.log(`Server is listening on port ${PORT}.`);
+    console.log(`Server is running at http://localhost:${PORT}`);
 });
-
